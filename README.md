@@ -79,4 +79,5 @@ CG-lab/
 
 ## 效果展示
 
-<video src="./assets/videos/实验视频0.mp4" controls=""></video>
+
+![demo](./assets/videos/实验视频0.gif)
