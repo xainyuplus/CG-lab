@@ -251,3 +251,7 @@ python -m src.work2.main
 - 按 `D` 或 `→` 向右旋转立方体
 - 关闭窗口退出程序
 
+## 效果展示
+
+
+![demo](./assets/videos/实验视频2.gif)
