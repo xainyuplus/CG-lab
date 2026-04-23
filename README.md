@@ -255,3 +255,238 @@ python -m src.work2.main
 
 
 ![demo](./assets/videos/实验视频2.gif)
+
+
+
+---
+
+## 实验 3：Bézier 曲线与光栅化
+
+### 概述
+
+通过实现 **De Casteljau 算法** 计算 Bézier 曲线上的采样点，并结合 Taichi 的 GPU 字段与 kernel 将曲线光栅化到屏幕像素缓冲区中进行显示。展示计算机图形学中从**参数曲线生成**到**离散像素绘制**的基本流程。
+
+### 核心特性
+
+* **Bézier 曲线生成**：使用 De Casteljau 算法递归计算曲线上的点
+* **GPU 光栅化**：将曲线采样点批量上传到 GPU 并并行写入像素缓冲区
+* **交互控制点**：通过鼠标左键添加控制点，实时观察曲线形状变化
+* **平滑显示对比**：实现普通像素映射与双线性插值两种绘制方式，比较显示效果差异
+
+### 技术实现
+
+#### 1. 曲线采样与显示参数
+
+在 `config.py` 中定义窗口大小、曲线采样数、控制点数量上限以及颜色等参数：
+
+```python
+WINDOW_RES = (800, 800)    # 窗口分辨率
+NUM_SEGMENTS = 1000         # 曲线采样数
+MAX_CONTROL_POINTS = 100    # 最大控制点数量
+CONTROL_POINT_COLOR = (1.0, 0.0, 0.0)  # 控制点颜色（红色）
+CURVE_COLOR = (0.0, 1.0, 0.0)          # 曲线颜色（绿色）
+CONTROL_POINT_RADIUS = 2 / WINDOW_RES[1]
+```
+
+其中，`NUM_SEGMENTS = 1000` 表示将参数区间 `[0,1]` 等分为 1000 段，因此每次会计算 `1001` 个曲线采样点，用于后续光栅化显示。
+
+#### 2. De Casteljau 曲线计算
+
+在 `main.py` 中实现 De Casteljau 算法，用于计算 Bézier 曲线在参数 `t` 处对应的点：
+
+```python
+def de_casteljau(points, t):
+    """De Casteljau算法计算贝塞尔曲线上的点"""
+    p = points[:]
+    n = len(p)
+    for r in range(1, n):
+        for i in range(n - r):
+            p[i] = (1 - t) * np.array(p[i]) + t * np.array(p[i + 1])
+    return p[0]
+```
+
+其基本思想是：
+对控制点序列不断进行相邻点之间的线性插值，每进行一轮，点的数量减少 1，直到最后只剩下 1 个点，这个点就是曲线在参数 `t` 处的位置。
+
+主程序中会对 `t = i / NUM_SEGMENTS` 逐个采样，从而得到整条曲线上的离散点：
+
+```python
+curve_points_list = []
+for i in range(NUM_SEGMENTS + 1):
+    t = i / NUM_SEGMENTS
+    point = de_casteljau(control_points, t)
+    curve_points_list.append(point)
+```
+
+这样就完成了从控制点到 Bézier 曲线采样点的计算。
+
+#### 3. GPU字段与像素缓冲区
+
+在 `physics.py` 中预先定义了三个 Taichi 字段：
+
+```python
+pixels = ti.Vector.field(3, dtype=float, shape=WINDOW_RES)  # 最终画面
+curve_points_field = ti.Vector.field(2, dtype=float, shape=NUM_SEGMENTS + 1)  # 曲线坐标
+gui_points = ti.Vector.field(2, dtype=float, shape=MAX_CONTROL_POINTS)  # 控制点对象池
+```
+
+它们分别用于：
+
+* `pixels`：保存最终显示的 RGB 像素
+* `curve_points_field`：保存曲线采样点坐标
+* `gui_points`：保存控制点位置，用于绘制控制点
+
+这种预分配方式避免了在实时循环中频繁创建 GPU 数据结构，使程序运行更加稳定流畅。
+
+#### 4. 普通插值与双线性插值
+
+在将曲线点映射到屏幕像素时，可以采用两种不同方式。
+
+**普通插值（最近像素点写入）**：
+直接将浮点坐标映射到一个整数像素位置并点亮该像素。`physics.py` 中已经保留了这部分实现代码：
+
+```python
+# 直接写入像素（不做抗锯齿）
+# x, y = curve_points_field[i]
+# px = int(x * WINDOW_RES[0])
+# py = int(y * WINDOW_RES[1])
+# if 0 <= px < WINDOW_RES[0] and 0 <= py < WINDOW_RES[1]:
+#     pixels[px, py] = [0.0, 1.0, 0.0]  # 绿色
+```
+
+这种方式实现简单，但因为一个曲线点只会落到一个像素上，所以显示时容易出现锯齿和离散感。
+
+**双线性插值（平滑采样）**：
+当前程序实际启用的是双线性插值方案。其做法是：先找到曲线点所在连续像素坐标周围的四个邻近像素，再根据点到四个像素的距离计算权重，并将亮度按权重分配给这四个像素：
+
+```python
+@ti.kernel
+def draw_curve_kernel(n: ti.i32):
+    """GPU绘制曲线内核：对单色曲线做双线性插值写入"""
+    W = WINDOW_RES[0]
+    H = WINDOW_RES[1]
+
+    for i in range(n):
+        x, y = curve_points_field[i]
+
+        # 归一化坐标 -> 像素连续坐标
+        fx = x * (W - 1)
+        fy = y * (H - 1)
+
+        x0 = int(fx)
+        y0 = int(fy)
+        x1 = x0 + 1
+        y1 = y0 + 1
+
+        dx = fx - x0
+        dy = fy - y0
+
+        # 双线性权重
+        w00 = (1.0 - dx) * (1.0 - dy)
+        w10 = dx * (1.0 - dy)
+        w01 = (1.0 - dx) * dy
+        w11 = dx * dy
+
+        # 分配到四个邻近像素，只写绿色通道
+        if 0 <= x0 < W and 0 <= y0 < H:
+            pixels[x0, y0][1] = max(pixels[x0, y0][1], w00)
+
+        if 0 <= x1 < W and 0 <= y0 < H:
+            pixels[x1, y0][1] = max(pixels[x1, y0][1], w10)
+
+        if 0 <= x0 < W and 0 <= y1 < H:
+            pixels[x0, y1][1] = max(pixels[x0, y1][1], w01)
+
+        if 0 <= x1 < W and 0 <= y1 < H:
+            pixels[x1, y1][1] = max(pixels[x1, y1][1], w11)
+```
+
+相比普通插值，双线性插值能够让曲线在像素网格上的亮度过渡更加平滑，因此视觉效果更自然。
+
+需要说明的是，这里的“普通插值”和“双线性插值”比较的是**曲线点映射到像素时的采样方式**，而不是 Bézier 曲线本身的求点算法。Bézier 曲线点仍然是通过 De Casteljau 算法计算得到的。
+
+#### 5. 主程序与交互绘制
+
+在 `main.py` 中，主循环负责处理用户输入、计算曲线并完成渲染：
+
+```python
+def run():
+    window = ti.ui.Window("Bézier Curve", WINDOW_RES)
+    canvas = window.get_canvas()
+
+    control_points = []
+
+    while window.running:
+        # 清空pixels
+        clear_pixels()
+
+        # 处理事件
+        for e in window.get_events(ti.ui.PRESS):
+            if e.key == ti.ui.LMB:
+                if len(control_points) < MAX_CONTROL_POINTS:
+                    pos = window.get_cursor_pos()
+                    control_points.append(pos)
+            elif e.key == 'c':
+                control_points = []
+
+        # 计算并绘制曲线
+        if len(control_points) >= 2:
+            curve_points_list = []
+            for i in range(NUM_SEGMENTS + 1):
+                t = i / NUM_SEGMENTS
+                point = de_casteljau(control_points, t)
+                curve_points_list.append(point)
+            curve_points_field.from_numpy(np.array(curve_points_list))
+            draw_curve_kernel(NUM_SEGMENTS + 1)
+
+        # 绘制控制点
+        gui_points_np = np.full((MAX_CONTROL_POINTS, 2), -10.0)
+        for i, p in enumerate(control_points):
+            gui_points_np[i] = p
+        gui_points.from_numpy(gui_points_np)
+
+        canvas.set_image(pixels)
+        canvas.circles(gui_points, radius=CONTROL_POINT_RADIUS, color=CONTROL_POINT_COLOR)
+
+        window.show()
+```
+
+这里的流程可以概括为：
+
+1. 清空上一帧像素缓冲区
+2. 响应鼠标和键盘输入
+3. 若控制点数量不少于 2，则重新计算曲线采样点
+4. 将采样点上传到 GPU 字段并调用 kernel 绘制
+5. 将控制点绘制为红色圆点
+6. 显示当前帧画面
+
+其中，控制点绘制采用“对象池”思想：固定分配长度为 `MAX_CONTROL_POINTS` 的字段，多余位置填充屏幕外坐标，从而适配 `canvas.circles()` 的固定长度输入需求。
+
+### 运行程序
+
+```bash
+python -m src.work3.main
+```
+
+**交互方式**：
+
+* 鼠标左键点击：添加控制点
+* 按 `c`：清空控制点和曲线
+* 关闭窗口退出程序
+
+### 普通插值 vs 双线性插值
+
+* **普通插值**：将曲线采样点直接映射到单个像素上，只点亮最近的像素点，实现简单，但边缘容易出现锯齿和断裂。
+* **双线性插值**：将曲线点对周围四个邻近像素按权重分配亮度，使像素过渡更平滑，减轻锯齿感，显示效果更好。
+
+## 效果展示
+
+普通插值（最近像素点）：
+
+![demo](./assets/videos/实验三-贝塞尔曲线-普通插值.gif)
+
+双线性插值（像素级平滑采样）：
+
+![demo](./assets/videos/实验三-贝塞尔曲线-双线性插值.gif)
+
+
