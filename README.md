@@ -30,6 +30,7 @@ CG-lab/
 | 实验 0 | 粒子群系统 | [目录](src/work0/) / [详情](#实验-0粒子群系统) |
 | 实验 2 | MVP变换与3D立方体 | [目录](src/work2/) / [详情](#实验-2mvp变换与3d立方体) |
 | 实验 3 | Bézier 曲线与光栅化 | [目录](src/work3/) / [详情](#实验-3bézier-曲线与光栅化) |
+| 实验 4 | Phong光照模型 | [目录](src/work4/) / [详情](#实验-4phong光照模型) |
 
 ---
 
@@ -489,5 +490,135 @@ python -m src.work3.main
 双线性插值（像素级平滑采样）：
 
 ![demo](./assets/videos/实验三-贝塞尔曲线-双线性插值.gif)
+
+---
+
+## 实验 4：Phong光照模型
+
+### 概述
+
+通过实现 **Phong光照模型**，使用光线投射（Ray Casting）技术渲染3D场景中的球体和圆锥。展示局部光照的基本原理，包括环境光、漫反射和镜面高光，并通过UI界面实时调节材质参数，直观感受光照效果。
+
+### 核心特性
+
+- **光线投射渲染**：基于数学隐式定义的几何体，实现像素级光线求交
+- **Phong光照模型**：完整实现环境光、漫反射和镜面高光计算
+- **深度测试**：正确处理遮挡关系，选择最近交点进行着色
+- **交互式参数调节**：通过滑动条实时调整Ka、Kd、Ks和Shininess参数
+- **GPU并行计算**：利用Taichi框架实现高效渲染
+
+### 技术实现
+
+#### 1. 场景几何定义
+
+在 `config.py` 中定义球体和圆锥的参数：
+
+```python
+# 球体参数
+SPHERE_CENTER = [-1.2, -0.2, 0.0]
+SPHERE_RADIUS = 1.2
+SPHERE_COLOR = [0.8, 0.1, 0.1]
+
+# 圆锥参数
+CONE_APEX = [1.2, 1.2, 0.0]
+CONE_BASE_Y = -1.4
+CONE_RADIUS = 1.2
+CONE_COLOR = [0.6, 0.2, 0.8]
+```
+
+#### 2. 光线求交计算
+
+在 `physics.py` 中实现球体和圆锥的光线求交：
+
+**球体求交**：
+```python
+@ti.func
+def intersect_sphere(ray_origin, ray_dir):
+    oc = ray_origin - SPHERE_CENTER_VEC
+    a = ray_dir.dot(ray_dir)
+    b = 2.0 * oc.dot(ray_dir)
+    c = oc.dot(oc) - SPHERE_RADIUS * SPHERE_RADIUS
+    discriminant = b * b - 4 * a * c
+    # 解二次方程，返回最近正根
+```
+
+**圆锥求交**：
+```python
+@ti.func
+def intersect_cone(ray_origin, ray_dir):
+    # 圆锥方程：x^2 + z^2 = k^2 * y^2
+    # 解二次方程并检查高度范围
+```
+
+#### 3. Phong光照模型
+
+在交点处计算光照：
+
+```python
+@ti.func
+def phong_shading(point, normal, view_dir, ka, kd, ks, shininess, obj_color):
+    light_dir = (LIGHT_POS_VEC - point).normalized()
+    reflect_dir = (2 * normal.dot(light_dir) * normal - light_dir).normalized()
+    
+    ambient = ka * LIGHT_COLOR_VEC * obj_color
+    diffuse = kd * ti.max(0.0, normal.dot(light_dir)) * LIGHT_COLOR_VEC * obj_color
+    specular = ks * ti.pow(ti.max(0.0, reflect_dir.dot(view_dir)), shininess) * LIGHT_COLOR_VEC
+    
+    return ambient + diffuse + specular
+```
+
+#### 4. 渲染kernel
+
+在 `render` kernel 中实现完整渲染流程：
+
+```python
+@ti.kernel
+def render(ka: float, kd: float, ks: float, shininess: float):
+    for i, j in image:
+        # 计算光线方向
+        x = (i - WINDOW_RES[0] / 2) / (WINDOW_RES[0] / 2)
+        y = (j - WINDOW_RES[1] / 2) / (WINDOW_RES[1] / 2)
+        ray_dir = ti.Vector([x, y, -1.0]).normalized()
+        
+        # 求交测试
+        t_sphere = intersect_sphere(CAMERA_POS_VEC, ray_dir)
+        t_cone = intersect_cone(CAMERA_POS_VEC, ray_dir)
+        
+        # 深度测试与着色
+        # ...
+```
+
+#### 5. UI交互界面
+
+在 `main.py` 中使用Taichi UI创建滑动条：
+
+```python
+with window.GUI.sub_window("Phong Parameters", 0.05, 0.05, 0.3, 0.4) as w:
+    ka = w.slider_float("Ka (Ambient)", ka, 0.0, 1.0)
+    kd = w.slider_float("Kd (Diffuse)", kd, 0.0, 1.0)
+    ks = w.slider_float("Ks (Specular)", ks, 0.0, 1.0)
+    shininess = w.slider_float("Shininess", shininess, 1.0, 128.0)
+```
+
+### 运行程序
+
+```bash
+python -m src.work4.main
+```
+
+**交互方式**：
+- 调节滑动条观察不同参数对光照效果的影响
+- 关闭窗口退出程序
+
+### 参数说明
+
+- **Ka (环境光系数)**：控制环境光的强度，默认0.2
+- **Kd (漫反射系数)**：控制漫反射光的强度，默认0.7
+- **Ks (镜面高光系数)**：控制镜面高光的强度，默认0.5
+- **Shininess (高光指数)**：控制镜面高光的锐度，默认32.0
+
+## 效果展示
+
+![demo](./assets/videos/实验四.gif)
 
 
